@@ -1,0 +1,285 @@
+
+# Scheduled pipeline to clean up old AWS resources
+
+# ---- No CI trigger (only scheduled + manual) ----
+trigger: none
+pr: none
+
+
+# Cron format: minute hour day-of-month month day-of-week
+# Azure DevOps cron uses UTC timezone!
+schedules:
+  # Schedule 1: Every day at 11:30 PM IST (= 6:00 PM UTC)
+  - cron: '0 18 * * *'
+    displayName: 'Daily Cleanup (11:30 PM IST)'
+    branches:
+      include:
+        - master
+    always: false    # Only run if there are changes (or resources exist)
+
+  # Schedule 2: Every Friday at 11:00 PM IST (= 5:30 PM UTC)
+  - cron: '30 17 * * 5'
+    displayName: 'Weekly Cleanup (Friday 11 PM IST)'
+    branches:
+      include:
+        - master
+    always: true     # Always run on Friday (even if no changes)
+
+pool:
+  name: aws-ec2-pool
+
+variables:
+  AWS_DEFAULT_REGION: 'us-east-1'
+  CLEANUP_AGE_HOURS: '24'          # Delete resources older than 24 hours
+  DRY_RUN: 'true'                 # Set to 'true' to preview without deleting
+
+stages:
+  # Discover Old Resources 
+  - stage: Discover
+    displayName: 'Stage 1 - Discover Old Resources'
+    jobs:
+      - job: ScanResources
+        displayName: 'Scan for Old Resources'
+        steps:
+          - script: |
+              echo "============================================"
+              echo "  AWS Resource Cleanup Scanner"
+              echo "  Time (UTC): $(date -u)"
+              echo "  Region:     $(AWS_DEFAULT_REGION)"
+              echo "  Max Age:    $(CLEANUP_AGE_HOURS) hours"
+              echo "  Dry Run:    $(DRY_RUN)"
+              echo "============================================"
+
+              # Calculate cutoff time
+              CUTOFF=$(date -u -d "$(CLEANUP_AGE_HOURS) hours ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null || \
+                       date -u -v-$(CLEANUP_AGE_HOURS)H +%Y-%m-%dT%H:%M:%S)
+              echo "Cutoff time: $CUTOFF"
+              echo ""
+
+              # --- Scan EC2 Instances ---
+              echo "=== EC2 Instances (tagged: Environment=dev) ==="
+              OLD_INSTANCES=$(aws ec2 describe-instances \
+                --filters "Name=tag:Environment,Values=dev" \
+                         "Name=instance-state-name,Values=running,stopped" \
+                         "Name=tag:auto-delete,Values=yes" \
+                --query "Reservations[].Instances[?LaunchTime<='${CUTOFF}'].[InstanceId,LaunchTime,Tags[?Key=='Name'].Value|[0]]" \
+                --output text \
+                --region $(AWS_DEFAULT_REGION) 2>/dev/null || echo "")
+
+              if [ -n "$OLD_INSTANCES" ]; then
+                echo "$OLD_INSTANCES"
+                echo "$OLD_INSTANCES" > $(Build.ArtifactStagingDirectory)/old-instances.txt
+              else
+                echo "No old instances found "
+                echo "" > $(Build.ArtifactStagingDirectory)/old-instances.txt
+              fi
+
+              echo ""
+
+              # --- Scan Old AMIs ---
+              echo "=== Custom AMIs (older than $(CLEANUP_AGE_HOURS) hours) ==="
+              OLD_AMIS=$(aws ec2 describe-images \
+                --owners self \
+                --query "Images[?CreationDate<='${CUTOFF}'].[ImageId,CreationDate,Name]" \
+                --output text \
+                --region $(AWS_DEFAULT_REGION) 2>/dev/null || echo "")
+
+              if [ -n "$OLD_AMIS" ]; then
+                echo "$OLD_AMIS"
+                echo "$OLD_AMIS" > $(Build.ArtifactStagingDirectory)/old-amis.txt
+              else
+                echo "No old AMIs found "
+                echo "" > $(Build.ArtifactStagingDirectory)/old-amis.txt
+              fi
+
+              echo ""
+
+              # --- Scan Unattached EBS Volumes ---
+              echo "=== Unattached EBS Volumes ==="
+              UNATTACHED_VOLS=$(aws ec2 describe-volumes \
+                --filters "Name=status,Values=available" \
+                          "Name=tag:Environment,Values=dev" \
+                --query "Volumes[].[VolumeId,CreateTime,Size]" \
+                --output text \
+                --region $(AWS_DEFAULT_REGION) 2>/dev/null || echo "")
+
+              if [ -n "$UNATTACHED_VOLS" ]; then
+                echo "$UNATTACHED_VOLS"
+                echo "$UNATTACHED_VOLS" > $(Build.ArtifactStagingDirectory)/old-volumes.txt
+              else
+                echo "No unattached volumes found "
+                echo "" > $(Build.ArtifactStagingDirectory)/old-volumes.txt
+              fi
+
+              echo ""
+
+              # --- Scan Old Security Groups ---
+              echo "=== Unused Security Groups (dev) ==="
+              UNUSED_SGS=$(aws ec2 describe-security-groups \
+                --filters "Name=tag:Environment,Values=dev" \
+                --query "SecurityGroups[?GroupName!='default'].[GroupId,GroupName]" \
+                --output text \
+                --region $(AWS_DEFAULT_REGION) 2>/dev/null || echo "")
+
+              if [ -n "$UNUSED_SGS" ]; then
+                echo "$UNUSED_SGS"
+                echo "$UNUSED_SGS" > $(Build.ArtifactStagingDirectory)/old-sgs.txt
+              else
+                echo "No unused security groups found "
+                echo "" > $(Build.ArtifactStagingDirectory)/old-sgs.txt
+              fi
+
+              echo ""
+              echo "============================================"
+              echo "  Scan Complete!"
+              echo "============================================"
+            displayName: 'Scan Old Resources'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'cleanup-report'
+              publishLocation: 'Container'
+            displayName: 'Publish Scan Report'
+
+  # Cleanup Resources ----
+  - stage: Cleanup
+    displayName: 'Stage 2 - Cleanup Resources'
+    dependsOn: Discover
+    jobs:
+      - job: DestroyResources
+        displayName: 'Destroy Old Resources'
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'cleanup-report'
+              downloadPath: '$(Pipeline.Workspace)'
+            displayName: 'Download Scan Report'
+
+          # --- Terminate Old EC2 Instances ---
+          - script: |
+              echo "=== Terminating Old EC2 Instances ==="
+              REPORT="$(Pipeline.Workspace)/cleanup-report/old-instances.txt"
+
+              if [ ! -s "$REPORT" ]; then
+                echo "No instances to terminate "
+                exit 0
+              fi
+
+              while read -r INSTANCE_ID LAUNCH_TIME NAME; do
+                if [ -z "$INSTANCE_ID" ]; then continue; fi
+
+                if [ "$(DRY_RUN)" = "true" ]; then
+                  echo "[DRY RUN] Would terminate: $INSTANCE_ID ($NAME) launched $LAUNCH_TIME"
+                else
+                  echo "Terminating: $INSTANCE_ID ($NAME) launched $LAUNCH_TIME"
+                  aws ec2 terminate-instances \
+                    --instance-ids "$INSTANCE_ID" \
+                    --region $(AWS_DEFAULT_REGION) 2>/dev/null && \
+                    echo "Terminated $INSTANCE_ID" || \
+                    echo "Failed to terminate $INSTANCE_ID"
+                fi
+              done < "$REPORT"
+            displayName: 'Terminate Old Instances'
+
+          # --- Deregister Old AMIs ---
+          - script: |
+              echo "=== Deregistering Old AMIs ==="
+              REPORT="$(Pipeline.Workspace)/cleanup-report/old-amis.txt"
+
+              if [ ! -s "$REPORT" ]; then
+                echo "No AMIs to deregister "
+                exit 0
+              fi
+
+              while read -r AMI_ID CREATION_DATE NAME; do
+                if [ -z "$AMI_ID" ]; then continue; fi
+
+                if [ "$(DRY_RUN)" = "true" ]; then
+                  echo "[DRY RUN] Would deregister: $AMI_ID ($NAME) created $CREATION_DATE"
+                else
+                  echo "Deregistering: $AMI_ID ($NAME) created $CREATION_DATE"
+
+                  # Find and delete associated snapshots
+                  SNAPSHOTS=$(aws ec2 describe-images \
+                    --image-ids "$AMI_ID" \
+                    --query "Images[].BlockDeviceMappings[].Ebs.SnapshotId" \
+                    --output text \
+                    --region $(AWS_DEFAULT_REGION) 2>/dev/null || echo "")
+
+                  aws ec2 deregister-image \
+                    --image-id "$AMI_ID" \
+                    --region $(AWS_DEFAULT_REGION) 2>/dev/null && \
+                    echo "Deregistered $AMI_ID" || \
+                    echo "Failed to deregister $AMI_ID"
+
+                  # Delete snapshots
+                  for SNAP_ID in $SNAPSHOTS; do
+                    if [ "$SNAP_ID" != "None" ] && [ -n "$SNAP_ID" ]; then
+                      aws ec2 delete-snapshot \
+                        --snapshot-id "$SNAP_ID" \
+                        --region $(AWS_DEFAULT_REGION) 2>/dev/null && \
+                        echo "Deleted snapshot $SNAP_ID" || \
+                        echo "Failed to delete snapshot $SNAP_ID"
+                    fi
+                  done
+                fi
+              done < "$REPORT"
+            displayName: 'Deregister Old AMIs'
+
+          # --- Delete Unattached Volumes ---
+          - script: |
+              echo "=== Deleting Unattached EBS Volumes ==="
+              REPORT="$(Pipeline.Workspace)/cleanup-report/old-volumes.txt"
+
+              if [ ! -s "$REPORT" ]; then
+                echo "No volumes to delete"
+                exit 0
+              fi
+
+              while read -r VOL_ID CREATE_TIME SIZE; do
+                if [ -z "$VOL_ID" ]; then continue; fi
+
+                if [ "$(DRY_RUN)" = "true" ]; then
+                  echo "[DRY RUN] Would delete: $VOL_ID (${SIZE}GB) created $CREATE_TIME"
+                else
+                  echo "Deleting: $VOL_ID (${SIZE}GB) created $CREATE_TIME"
+                  aws ec2 delete-volume \
+                    --volume-id "$VOL_ID" \
+                    --region $(AWS_DEFAULT_REGION) 2>/dev/null && \
+                    echo "Deleted $VOL_ID" || \
+                    echo "Failed to delete $VOL_ID"
+                fi
+              done < "$REPORT"
+            displayName: 'Delete Unattached Volumes'
+
+          # --- Summary ---
+          - script: |
+              echo "============================================"
+              echo "  Cleanup Summary"
+              echo "  Time (UTC): $(date -u)"
+              echo "  Dry Run:    $(DRY_RUN)"
+              echo "============================================"
+
+              echo ""
+              INSTANCES=$(wc -l < "$(Pipeline.Workspace)/cleanup-report/old-instances.txt" 2>/dev/null || echo "0")
+              AMIS=$(wc -l < "$(Pipeline.Workspace)/cleanup-report/old-amis.txt" 2>/dev/null || echo "0")
+              VOLUMES=$(wc -l < "$(Pipeline.Workspace)/cleanup-report/old-volumes.txt" 2>/dev/null || echo "0")
+
+              echo "Resources processed:"
+              echo "  EC2 Instances: $INSTANCES"
+              echo "  AMIs:          $AMIS"
+              echo "  EBS Volumes:   $VOLUMES"
+              echo ""
+
+              if [ "$(DRY_RUN)" = "true" ]; then
+                echo "DRY RUN — No resources were actually deleted"
+                echo "Set DRY_RUN=false to perform actual cleanup"
+              else
+                echo "Cleanup complete!"
+              fi
+              echo "============================================"
+            displayName: 'Cleanup Summary'
+
