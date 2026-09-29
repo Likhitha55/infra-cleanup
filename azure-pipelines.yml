@@ -55,7 +55,7 @@ stages:
               aws ec2 describe-instances \
                 --filters "Name=tag:auto-delete,Values=yes" \
                          "Name=instance-state-name,Values=running,stopped" \
-                --query "Reservations[].Instances[].[InstanceId,LaunchTime,Tags[?Key=='Name'].Value|]" \
+                --query "Reservations[].Instances[].[InstanceId,LaunchTime,Tags[?Key=='Name'].Value]" \
                 --output text \
                 --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-instances.txt 2>/dev/null
 
@@ -74,7 +74,7 @@ stages:
                 --filters "Name=tag:auto-delete,Values=yes" \
                 --query "Images[].[ImageId,CreationDate,Name]" \
                 --output text \
-                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-amis.txt 2>/dev/null
+                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-amis.txt 
 
               if [ -s "$(Build.ArtifactStagingDirectory)/old-amis.txt" ]; then
                 echo "Found AMIs to clean:"
@@ -91,7 +91,7 @@ stages:
                           "Name=tag:auto-delete,Values=yes" \
                 --query "Volumes[].[VolumeId,CreateTime,Size]" \
                 --output text \
-                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-volumes.txt 2>/dev/null
+                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-volumes.txt 
 
               if [ -s "$(Build.ArtifactStagingDirectory)/old-volumes.txt" ]; then
                 echo "Found volumes to clean:"
