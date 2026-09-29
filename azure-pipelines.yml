@@ -45,95 +45,67 @@ stages:
               echo "============================================"
               echo "  AWS Resource Cleanup Scanner"
               echo "  Time (UTC): $(date -u)"
-              echo "  Region:     $(AWS_DEFAULT_REGION)"
-              echo "  Max Age:    $(CLEANUP_AGE_HOURS) hours"
               echo "  Dry Run:    $(DRY_RUN)"
+              echo "  Filter:     auto-delete=yes ONLY"
               echo "============================================"
 
-              # Calculate cutoff time
-              CUTOFF=$(date -u -d "$(CLEANUP_AGE_HOURS) hours ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null || \
-                       date -u -v-$(CLEANUP_AGE_HOURS)H +%Y-%m-%dT%H:%M:%S)
-              echo "Cutoff time: $CUTOFF"
+              # --- EC2: ONLY filter by tag, NO age filter ---
               echo ""
-
-              # --- Scan EC2 Instances ---
-              echo "=== EC2 Instances (tagged: Environment=dev) ==="
-              OLD_INSTANCES=$(aws ec2 describe-instances \
-                --filters "Name=tag:Environment,Values=dev" \
+              echo "=== EC2 Instances (auto-delete=yes) ==="
+              aws ec2 describe-instances \
+                --filters "Name=tag:auto-delete,Values=yes" \
                          "Name=instance-state-name,Values=running,stopped" \
-                         "Name=tag:auto-delete,Values=yes" \
-                --query "Reservations[].Instances[?LaunchTime<='${CUTOFF}'].[InstanceId,LaunchTime,Tags[?Key=='Name'].Value|[0]]" \
+                --query "Reservations[].Instances[].[InstanceId,LaunchTime,Tags[?Key=='Name'].Value|]" \
                 --output text \
-                --region $(AWS_DEFAULT_REGION) 2>/dev/null || echo "")
+                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-instances.txt 2>/dev/null
 
-              if [ -n "$OLD_INSTANCES" ]; then
-                echo "$OLD_INSTANCES"
-                echo "$OLD_INSTANCES" > $(Build.ArtifactStagingDirectory)/old-instances.txt
+              if [ -s "$(Build.ArtifactStagingDirectory)/old-instances.txt" ]; then
+                echo "Found instances to clean:"
+                cat $(Build.ArtifactStagingDirectory)/old-instances.txt
               else
-                echo "No old instances found "
-                echo "" > $(Build.ArtifactStagingDirectory)/old-instances.txt
+                echo "No instances found"
               fi
 
+              # --- AMIs: tagged auto-delete=yes ---
               echo ""
-
-              # --- Scan Old AMIs ---
-              echo "=== Custom AMIs (older than $(CLEANUP_AGE_HOURS) hours) ==="
-              OLD_AMIS=$(aws ec2 describe-images \
+              echo "=== Custom AMIs (auto-delete=yes) ==="
+              aws ec2 describe-images \
                 --owners self \
-                --query "Images[?CreationDate<='${CUTOFF}'].[ImageId,CreationDate,Name]" \
+                --filters "Name=tag:auto-delete,Values=yes" \
+                --query "Images[].[ImageId,CreationDate,Name]" \
                 --output text \
-                --region $(AWS_DEFAULT_REGION) 2>/dev/null || echo "")
+                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-amis.txt 2>/dev/null
 
-              if [ -n "$OLD_AMIS" ]; then
-                echo "$OLD_AMIS"
-                echo "$OLD_AMIS" > $(Build.ArtifactStagingDirectory)/old-amis.txt
+              if [ -s "$(Build.ArtifactStagingDirectory)/old-amis.txt" ]; then
+                echo "Found AMIs to clean:"
+                cat $(Build.ArtifactStagingDirectory)/old-amis.txt
               else
-                echo "No old AMIs found "
-                echo "" > $(Build.ArtifactStagingDirectory)/old-amis.txt
+                echo "No AMIs found"
               fi
 
+              # --- EBS: unattached + tagged auto-delete=yes ---
               echo ""
-
-              # --- Scan Unattached EBS Volumes ---
-              echo "=== Unattached EBS Volumes ==="
-              UNATTACHED_VOLS=$(aws ec2 describe-volumes \
+              echo "=== Unattached EBS Volumes (auto-delete=yes) ==="
+              aws ec2 describe-volumes \
                 --filters "Name=status,Values=available" \
-                          "Name=tag:Environment,Values=dev" \
+                          "Name=tag:auto-delete,Values=yes" \
                 --query "Volumes[].[VolumeId,CreateTime,Size]" \
                 --output text \
-                --region $(AWS_DEFAULT_REGION) 2>/dev/null || echo "")
+                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-volumes.txt 2>/dev/null
 
-              if [ -n "$UNATTACHED_VOLS" ]; then
-                echo "$UNATTACHED_VOLS"
-                echo "$UNATTACHED_VOLS" > $(Build.ArtifactStagingDirectory)/old-volumes.txt
+              if [ -s "$(Build.ArtifactStagingDirectory)/old-volumes.txt" ]; then
+                echo "Found volumes to clean:"
+                cat $(Build.ArtifactStagingDirectory)/old-volumes.txt
               else
-                echo "No unattached volumes found "
-                echo "" > $(Build.ArtifactStagingDirectory)/old-volumes.txt
-              fi
-
-              echo ""
-
-              # --- Scan Old Security Groups ---
-              echo "=== Unused Security Groups (dev) ==="
-              UNUSED_SGS=$(aws ec2 describe-security-groups \
-                --filters "Name=tag:Environment,Values=dev" \
-                --query "SecurityGroups[?GroupName!='default'].[GroupId,GroupName]" \
-                --output text \
-                --region $(AWS_DEFAULT_REGION) 2>/dev/null || echo "")
-
-              if [ -n "$UNUSED_SGS" ]; then
-                echo "$UNUSED_SGS"
-                echo "$UNUSED_SGS" > $(Build.ArtifactStagingDirectory)/old-sgs.txt
-              else
-                echo "No unused security groups found "
-                echo "" > $(Build.ArtifactStagingDirectory)/old-sgs.txt
+                echo "No volumes found"
               fi
 
               echo ""
               echo "============================================"
               echo "  Scan Complete!"
               echo "============================================"
-            displayName: 'Scan Old Resources'
+            displayName: 'Scan Old Resources (auto-delete=yes only)'
+
 
           - task: PublishBuildArtifacts@1
             inputs:
@@ -283,3 +255,74 @@ stages:
               echo "============================================"
             displayName: 'Cleanup Summary'
 
+
+
+
+
+
+
+
+          - script: |
+              echo "============================================"
+              echo "  AWS Resource Cleanup Scanner"
+              echo "  Time (UTC): $(date -u)"
+              echo "  Dry Run:    $(DRY_RUN)"
+              echo "  Filter:     auto-delete=yes ONLY"
+              echo "============================================"
+
+              # --- EC2: ONLY filter by tag, NO age filter ---
+              echo ""
+              echo "=== EC2 Instances (auto-delete=yes) ==="
+              aws ec2 describe-instances \
+                --filters "Name=tag:auto-delete,Values=yes" \
+                         "Name=instance-state-name,Values=running,stopped" \
+                --query "Reservations[].Instances[].[InstanceId,LaunchTime,Tags[?Key=='Name'].Value|]" \
+                --output text \
+                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-instances.txt 2>/dev/null
+
+              if [ -s "$(Build.ArtifactStagingDirectory)/old-instances.txt" ]; then
+                echo "Found instances to clean:"
+                cat $(Build.ArtifactStagingDirectory)/old-instances.txt
+              else
+                echo "No instances found"
+              fi
+
+              # --- AMIs: tagged auto-delete=yes ---
+              echo ""
+              echo "=== Custom AMIs (auto-delete=yes) ==="
+              aws ec2 describe-images \
+                --owners self \
+                --filters "Name=tag:auto-delete,Values=yes" \
+                --query "Images[].[ImageId,CreationDate,Name]" \
+                --output text \
+                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-amis.txt 2>/dev/null
+
+              if [ -s "$(Build.ArtifactStagingDirectory)/old-amis.txt" ]; then
+                echo "Found AMIs to clean:"
+                cat $(Build.ArtifactStagingDirectory)/old-amis.txt
+              else
+                echo "No AMIs found"
+              fi
+
+              # --- EBS: unattached + tagged auto-delete=yes ---
+              echo ""
+              echo "=== Unattached EBS Volumes (auto-delete=yes) ==="
+              aws ec2 describe-volumes \
+                --filters "Name=status,Values=available" \
+                          "Name=tag:auto-delete,Values=yes" \
+                --query "Volumes[].[VolumeId,CreateTime,Size]" \
+                --output text \
+                --region $(AWS_DEFAULT_REGION) > $(Build.ArtifactStagingDirectory)/old-volumes.txt 2>/dev/null
+
+              if [ -s "$(Build.ArtifactStagingDirectory)/old-volumes.txt" ]; then
+                echo "Found volumes to clean:"
+                cat $(Build.ArtifactStagingDirectory)/old-volumes.txt
+              else
+                echo "No volumes found"
+              fi
+
+              echo ""
+              echo "============================================"
+              echo "  Scan Complete!"
+              echo "============================================"
+            displayName: 'Scan Old Resources (auto-delete=yes only)'
